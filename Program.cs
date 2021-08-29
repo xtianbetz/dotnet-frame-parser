@@ -1,19 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO.Ports;
 
 #nullable enable
 namespace dotnet_frame_parser
 {
-    class ParseResult<TF,TP>
+    interface IStreamProtocolParser<TM>
+    {
+        public FrameParseResult<TM> ReadFramesFromBuffer(byte[] bufSlice);
+    }
+    
+    class FrameParseResult<TF>
     {
         public List<TF> Frames = new List<TF>();
-        public TP ParserState;
-
-        public ParseResult(TP parserState)
-        {
-            ParserState = parserState;
-        }
     }
 
     class SimpleTwoByteMessage
@@ -30,25 +28,26 @@ namespace dotnet_frame_parser
     class SimpleTwoByteProtocolParserState
     {
         public SimpleTwoByteProtocolScannerState ScannerState = SimpleTwoByteProtocolScannerState.ExpectingHeader;
-        public byte[] PartialFrame = new byte[]{};
     }
 
-    class TwoByteProtocolParser : IStreamProtocolParser<SimpleTwoByteMessage, SimpleTwoByteProtocolParserState>
+    class TwoByteProtocolParser : IStreamProtocolParser<SimpleTwoByteMessage>
     {
-        public ParseResult<SimpleTwoByteMessage, SimpleTwoByteProtocolParserState> DecodeBytes(byte[] buf, SimpleTwoByteProtocolParserState parserState)
+        public SimpleTwoByteProtocolParserState State = new SimpleTwoByteProtocolParserState();
+        public FrameParseResult<SimpleTwoByteMessage> ReadFramesFromBuffer(byte[] buf)
         {
-           var result =  new ParseResult<SimpleTwoByteMessage,SimpleTwoByteProtocolParserState>(parserState);
+           var result =  new FrameParseResult<SimpleTwoByteMessage>();
            result.Frames = new List<SimpleTwoByteMessage>();
 
            var position = 0;
-           while (position < buf.Length)
+           var bufLen = buf.Length;
+           while (position < bufLen)
            {
-               switch (parserState.ScannerState)
+               switch (State.ScannerState)
                {
                    case SimpleTwoByteProtocolScannerState.ExpectingHeader:
                        if (buf[position] == 0x99)
                        {
-                           parserState.ScannerState = SimpleTwoByteProtocolScannerState.ExpectingValue;
+                           State.ScannerState = SimpleTwoByteProtocolScannerState.ExpectingValue;
                        }
                        else
                        {
@@ -56,23 +55,17 @@ namespace dotnet_frame_parser
                        }
                        break;
                    case SimpleTwoByteProtocolScannerState.ExpectingValue:
-                       parserState.ScannerState = SimpleTwoByteProtocolScannerState.ExpectingHeader;
+                       State.ScannerState = SimpleTwoByteProtocolScannerState.ExpectingHeader;
                        result.Frames.Add(new SimpleTwoByteMessage() {Value = buf[position]});
                        break;
                }
                position++;
            }
 
-           result.ParserState = parserState;
-
            return result;
         }
     }
 
-    interface IStreamProtocolParser<TM, TP>
-    {
-        public ParseResult<TM,TP> DecodeBytes(byte[] bufSlice, TP parserState);
-    }
 
     class Program
     {
@@ -94,21 +87,18 @@ namespace dotnet_frame_parser
             };
 
             var parser = new TwoByteProtocolParser();
-            var initialParserState = new SimpleTwoByteProtocolParserState();
-
-            var scanResult = parser.DecodeBytes(bufferSlice1, initialParserState);
+            var scanResult = parser.ReadFramesFromBuffer(bufferSlice1);
 
             foreach (var frame in scanResult.Frames)
             {
                 Console.WriteLine($"Got Frame {frame.Value}");
             }
 
-            var scanResult2 = parser.DecodeBytes(bufferSlice2, scanResult.ParserState);
+            var scanResult2 = parser.ReadFramesFromBuffer(bufferSlice2);
             foreach (var frame in scanResult2.Frames)
             {
                 Console.WriteLine($"Got Frame {frame.Value}");
             }
-
         }
 
         static void Main(string[] args)
