@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Reflection.Metadata;
 
@@ -35,7 +37,7 @@ namespace dotnet_frame_parser
     }
     class TagLengthValueMessage
     {
-        public byte[] Tag = new byte[] {0xDA, 0xBB, 0xAD, 0x00};
+        public byte[] Tag;
         public byte Length = 0;
         public byte[] Value = new byte[1024];
     }
@@ -52,18 +54,30 @@ namespace dotnet_frame_parser
         public TagLengthValueMessage CurrentFrame = new TagLengthValueMessage();
         public int ValueBytesRead = 0;
         public int TagBytesRead = 0;
-        public byte[] TagCandidate = new byte[4];
+        public byte[] TagCandidate = new byte[8];
     }
 
+    class MessagePattern
+    {
+        public byte[] Tag;
+        public byte[] Mask;
+    } 
+    
     class TagLengthValueProtocolParser : IStreamProtocolParser<TagLengthValueMessage>
     {
         public TagLengthValueProtocolParserState State = new TagLengthValueProtocolParserState();
 
-        public int TagLength = 4;
-        public List<byte[]> ValidTags = new List<byte[]>
+        public int TagLength = 8;
+        public List<MessagePattern> ValidTags = new List<MessagePattern>
         {
-            new byte[] {0xDA, 0xBB, 0xAD, 0x00}
+            new MessagePattern()
+            {
+                Tag  = new byte[] {0xFF, 0x00, 0xFF, 0xA5, 0xFF, 0xFF, 0xFF, 0xFF},
+                Mask = new byte[] {0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF},
+            }
         };
+
+        public static byte LengthModifier = 2;
 
         public FrameParseResult<TagLengthValueMessage> ReadFramesFromBuffer(byte[] buf)
         {
@@ -83,12 +97,6 @@ namespace dotnet_frame_parser
                strideLength = Math.Min(bufLen, bytesWeAreStillExpecting);
                position = strideLength - 1;
            }
-           else if (State.ScannerState == TagLengthValueProtocolScannerState.ExpectingTag)
-           {
-               var tagBytesWeAreStillExpecting = TagLength - State.TagBytesRead;
-               strideLength = Math.Min(bufLen, tagBytesWeAreStillExpecting);
-               position = strideLength - 1;
-           }
              
            while (true)
            {
@@ -96,18 +104,30 @@ namespace dotnet_frame_parser
                switch (State.ScannerState)
                {
                    case TagLengthValueProtocolScannerState.ExpectingTag:
+                       strideLength = 1;
                        var tagSrcStartPosition = nextTagChunkStartPosition;
-                       var tagDestStartPosition = State.TagBytesRead;
-                       Array.Copy(buf, tagSrcStartPosition, State.TagCandidate, tagDestStartPosition, strideLength);
-                       nextTagChunkStartPosition += strideLength;
-                       State.TagBytesRead += strideLength;
-                       var bytesRemainingInTag = TagLength - State.TagBytesRead; 
+                       State.TagCandidate[State.TagBytesRead] = buf[tagSrcStartPosition];
+                       nextTagChunkStartPosition += 1;
+                       State.TagBytesRead += 1;
+                       var bytesRemainingInTag = TagLength - State.TagBytesRead;
                        if (bytesRemainingInTag == 0)
                        {
                            var tagIsGood = false;
                            foreach (var validTag in ValidTags)
                            {
-                               if (validTag.SequenceEqual(State.TagCandidate))
+                               byte[] maskedCandidate = new byte[8];
+                               for (var i = 0; i < 8; i++)
+                               {
+                                   if (validTag.Mask[i] > 0)
+                                   {
+                                       maskedCandidate[i] = 0xFF;
+                                   }
+                                   else
+                                   {
+                                       maskedCandidate[i] = State.TagCandidate[i];
+                                   }
+                               }
+                               if (validTag.Tag.SequenceEqual(maskedCandidate))
                                {
                                    tagIsGood = true;
                                    break;
@@ -117,23 +137,19 @@ namespace dotnet_frame_parser
                            if (tagIsGood)
                            {
                                State.ScannerState = TagLengthValueProtocolScannerState.ExpectingLength;
+                               State.CurrentFrame.Tag = State.TagCandidate;
                            }
                            else
                            {
-                               State.TagCandidate = new byte[TagLength];
-                               State.TagBytesRead = 0;
-                               nextTagChunkStartPosition = position + 1;
+                               State.TagCandidate = State.TagCandidate.TakeLast(TagLength - 1).ToArray();
+                               Array.Resize(ref State.TagCandidate, TagLength);
+                               State.TagBytesRead = TagLength - 1;
                            }
-                           strideLength = 1;
-                       }
-                       else
-                       {
-                           strideLength = Math.Min(bytesRemainingInBuffer, bytesRemainingInTag);
                        }
                        break;
                    case TagLengthValueProtocolScannerState.ExpectingLength:
                        // TODO: validate length (using protocol properties MinFrameLength/MaxFrameLength)
-                       State.CurrentFrame.Length = buf[position];
+                       State.CurrentFrame.Length = (byte) (buf[position] + TagLengthValueProtocolParser.LengthModifier);
                        State.ScannerState = TagLengthValueProtocolScannerState.ExpectingMoreValueBytes;
                        State.ValueBytesRead = 0;
                        strideLength = Math.Min(bytesRemainingInBuffer, State.CurrentFrame.Length);
@@ -154,7 +170,7 @@ namespace dotnet_frame_parser
                            State.ValueBytesRead = 0;
                            State.TagCandidate = new byte[TagLength];
                            State.TagBytesRead = 0;
-                           strideLength = Math.Min(bytesRemainingInBuffer, TagLength);
+                           strideLength = 1;
                            nextTagChunkStartPosition = position + 1;
                        }
                        else
@@ -182,22 +198,15 @@ namespace dotnet_frame_parser
             var scanResult = parser.ReadFramesFromBuffer(bufSlice);
             foreach (var frame in scanResult.Frames)
             {
-                Console.WriteLine("Got TLV Frame, Tag = {0}, Value = {1}",
-                    Util.ByteArrayToHexString(frame.Tag, 4),
+                Console.WriteLine("Got TLV Frame, Tag = {0}, Length = {1:x2}, Value = {2}",
+                    Util.ByteArrayToHexString(frame.Tag, 8),
+                    frame.Length,
                     Util.ByteArrayToHexString(frame.Value, frame.Length));
             }
         }
         
-        public static void ReadAndProcessTlvMultibyteTag()
+        public static void ReadAndProcessTlvMultibyteTag(byte[] bufferSlice1)
         {
-            // Three frames of different sizes all with same four-byte tag
-            var bufferSlice1 = new byte[]
-            {
-                0xDA, 0xBB, 0xAD, 0x00, 0x03, 0x1, 0x2, 0x3,
-                0xDA, 0xBB, 0xAD, 0x00, 0x04, 0x1, 0x2, 0x3, 0x4,
-                0xDA, 0xBB, 0xAD, 0x00, 0x05, 0x1, 0x2, 0x3, 0x4, 0x5
-            };
-
             var parser = new TagLengthValueProtocolParser();
             Console.WriteLine("All at once");
             ScanAndDebugResult(parser, bufferSlice1);
@@ -205,7 +214,7 @@ namespace dotnet_frame_parser
             Console.WriteLine("1 byte at a time");
             ReadBufferInSteps(parser, bufferSlice1, 1);
             
-            for (var i = 2; i <= bufferSlice1.Length; i++)
+            for (var i = 2; i <= 32; i++)
             {
                 Console.WriteLine("{0} bytes at a time", i);
                 ReadBufferInSteps(parser, bufferSlice1, i);
@@ -232,10 +241,23 @@ namespace dotnet_frame_parser
                 ScanAndDebugResult(parser, chunk);
             }
         }
-
+       
+        public static byte[] StringToByteArray(string hexWithSpaces)
+        {
+            var hex = hexWithSpaces.Replace(" ", String.Empty);
+            
+            // Shamelessly stolen and modified from: https://stackoverflow.com/a/321404
+            return Enumerable.Range(0, hex.Length)
+                .Where(x => x % 2 == 0)
+                .Select(x => Convert.ToByte(hex.Substring(x, 2), 16))
+                .ToArray();
+        } 
+        
         static void Main(string[] args)
         {
-            ReadAndProcessTlvMultibyteTag();
+            var capturedHexBytesWithSpaces = File.ReadAllText(args[0]);
+            var rawBytes = StringToByteArray(capturedHexBytesWithSpaces);
+            ReadAndProcessTlvMultibyteTag(rawBytes);
         }
     }
 }
